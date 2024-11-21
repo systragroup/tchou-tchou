@@ -1,0 +1,7 @@
+local/*
+!local/.gitkeep
+
+notebooks/*
+!notebooks/.gitkeep
+
+**__pycache__**

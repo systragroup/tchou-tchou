@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "tchou-tchou"
+version = "0.1.0"
+description = ""
+authors = ["simon fortin <sfortin@systra.com>"]
+readme = "README.md"
+packages = [{ include = "tchou_tchou" }]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+ipykernel = "^6.29.5"
+geopandas = "^1.0.1"
+matplotlib = "^3.9.2"
+tqdm = "^4.67.0"
+contextily = "^1.6.2"
+snakeviz = "^2.2.2"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
