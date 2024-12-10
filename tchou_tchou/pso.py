@@ -6,6 +6,7 @@ import geopandas as gpd
 
 from tqdm import tqdm
 from shapely.geometry import LineString
+import math
 from tchou_tchou.utils import vector_angle
 
 
@@ -94,21 +95,37 @@ def _linestring(pos):
     ls = [LineString([(a, b) for a, b in zip(row1, row2)]) for row1, row2 in zip(df['X'].T.values, df['Y'].T.values)]
     return ls
 
-
 def _alignment(pos):
     ls_list = _linestring(pos)
     alignments = []
+    tangents_index = []
+    tangents_length = []
     for ls, R in zip(ls_list, pos.swaplevel(axis=1)['R'].iterrows()):
         R = R[1].to_list()
         coords = [ls.coords[0]]
+        indexes = [0]
         for i in range(1, len(ls.coords) - 1):
-            arc = arc_between_3pts(ls.coords[i - 1], ls.coords[i], ls.coords[i + 1], R[i])
-            coords += arc.coords
+            P0 = ls.coords[i - 1]
+            P1 = ls.coords[i]
+            P2 = ls.coords[i + 1]
+            if abs(angle_between_2_vectors(np.subtract(P0, P1), np.subtract(P2, P1)) - np.pi) < 0.1:
+                indexes += [indexes[-1]]
+            else:
+                arc = arc_between_3pts(P0, P1, P2, R[i])
+                coords += arc.coords
+                indexes += [indexes[-1] + len(arc.coords)]
         coords += [ls.coords[-1]]
+        lengths = [math.dist(coords[i + 1], coords[i]) for i in indexes]
         alignments.append(LineString(coords))
-    return gpd.GeoSeries(alignments, index=pos.index)
-
-
+        tangents_index.append(indexes)
+        tangents_length.append(np.round(lengths, 1))
+    return gpd.GeoDataFrame({'tangents_index': tangents_index,
+                             'tangents_length': tangents_length,
+                             'geometry': alignments},
+                            index=pos.index
+                            )
+ 
+ 
 def arc_between_3pts(P0, P1, P2, r):
     try:
         V1 = np.subtract(P0, P1)
@@ -126,20 +143,19 @@ def arc_between_3pts(P0, P1, P2, r):
         CC2 = np.subtract(c2, c)
         angle1 = vector_angle(CC1)
         angle2 = vector_angle(CC2)
-
+ 
         increments = 0.02
         theta = []
         while len(theta) <= 6:
-            if (angle1 - angle2) > np.pi:
-                angle1 -= 2 * np.pi
+            if abs(angle1 - angle2) > np.pi:
+                if angle1 >= np.pi:
+                    angle1 -= 2 * np.pi
+                else:
+                    angle2 -= 2 * np.pi
             theta = np.linspace(angle1, angle2, abs(int((angle2 - angle1) / increments)))
             increments /= 2
         x = c[0] + r * np.cos(theta)
         y = c[1] + r * np.sin(theta)
-
-        x = c[0] + r * np.cos(theta)
-        y = c[1] + r * np.sin(theta)
-
     except ValueError:
         print(P0)
         print(P1)

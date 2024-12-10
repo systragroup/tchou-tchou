@@ -1,19 +1,17 @@
-import rasterio
 from rasterio import features
-from rasterio.plot import show
-import matplotlib.pyplot as plt
 from shapely import geometry
-import geopandas as gpd
 import networkx as nx
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
 from rasterio.enums import Resampling
 from contextlib import contextmanager  
-
-import rasterio
 from rasterio import Affine, MemoryFile
 from rasterio.enums import Resampling
+
+
+def test():
+    print('vroom')
 
 # use context manager so DatasetReader and MemoryFile get cleaned up automatically
 @contextmanager
@@ -54,7 +52,8 @@ def get_slopes(df):
     return pd.concat([np.abs(dz) for dz in [a, b, c, d]]).groupby(level=0).max()
 
 def smooth_xy(df, **kwargs):
-    return df.ewm(axis=1,  **kwargs).mean().ewm(axis=0, **kwargs).mean()
+    mat = df.ewm(**kwargs).mean()
+    return mat.T.ewm(**kwargs).mean().T
 
 def get_impedance_raster(terrain, constraints, raster, inf=np.inf, pixel=10):
     layers = []
@@ -65,6 +64,46 @@ def get_impedance_raster(terrain, constraints, raster, inf=np.inf, pixel=10):
             layers.append(penalty*r)
     impedance_raster = np.clip(sum([l.astype(int ) for l in layers]), 0, inf)
     return impedance_raster
+
+import math
+def get_deltas(scope=1, radius=1):
+    """
+    return a list of tuples [(-1, -1), (-1, -1)] of deltas of the edges that  
+    can be chained while respecting a minimum radius of curvature
+    the unit of the radius is the same of the deltas
+    """
+    keys = []
+    delta_range = list(range(-scope, scope+1))
+    for dx in delta_range:
+        for dy in delta_range:
+            if dx != 0 or dy != 0 :
+                keys.append((dx, dy))
+
+    df = pd.DataFrame({'delta': pd.Series(keys)})
+    df['length'] = df['delta'].apply(lambda t: np.sqrt(t[0]**2 + t[1]**2))
+    df['rad'] = df['delta'].apply(lambda t: math.atan2(t[1], t[0]))
+    e_to_e = []
+    for da, la, ra in df.values:
+        for db, lb, rb in df.values:
+            dx = da[0] + db[0]
+            dy = db[1] + db[1]
+            lab = 0.5 * np.sqrt(dx**2 + dy**2) 
+            dr = rb-ra
+            if dr > np.pi:
+                dr = 2*np.pi-dr
+            if dr < -np.pi:
+                dr = 2*np.pi+dr
+            e_to_e.append([da, db, la, lb, lab, ra, rb, dr, (dx, dy)])
+
+    df = pd.DataFrame(e_to_e, columns=['a', 'b', 'la', 'lb', 'lab', 'ra', 'rb', 'dr', 'dxdy'])
+    df['dr_dl'] = df['dr'] / df['lab']
+    df['d_deg'] = df['dr'] * 180/np.pi
+    df['keep'] = True
+    df['keep'] = np.abs(df['dr_dl'])<= 1/radius 
+    #df['keep'] = df.loc[df]
+    #df.loc[df['dxdy'].isin(deltas.keys()), 'keep'] = False
+    keep_delta = df.loc[df['keep']][['a', 'b']].values.tolist() 
+    return keep_delta
 
 def get_graph(
         impedance_dataframe, dem, 
@@ -138,16 +177,55 @@ def get_graph(
     g.add_weighted_edges_from(edges)
     return g, imp, deltas
 
+def get_edge_graph(graph, keep_delta, nodes):
+    edges = list(graph.edges)
+    weights = [(a, b, graph.edges[a, b]['weight']) for a, b in edges]
+
+    d_list = []
+    for a, b, w in weights:
+        d = (b[0] - a[0], b[1] - a[1])
+        d_list.append([a, b, w, d, (a, b)])
+    indexed_edges = pd.DataFrame(d_list, columns=['a', 'b', 'w', 'delta', 'e'])#.set_index('delta')
+
+    delta_edges = {}
+    for d in tqdm(set(indexed_edges['delta'])):
+        delta_edges[d] = indexed_edges.loc[indexed_edges['delta'] == d]
+
+    to_concat = []
+    for da, db in tqdm(keep_delta):
+        left, right = delta_edges[da][['b','e', 'w']], delta_edges[db][['a','e', 'w']]
+        to_concat.append(pd.merge(left, right, left_on='b', right_on='a'))
+
+    edges = pd.concat(to_concat)
+    edges['w'] =( edges['w_x'] + edges['w_y'] )/ 2
+
+    ## ACCESS TO SOURCE AND TARGET
+    source_edges = indexed_edges.loc[indexed_edges['a'].isin(nodes)][['a', 'e', 'w']].copy()
+    source_edges['h'] = source_edges['w'] / 2 + 1000
+    target_edges = indexed_edges.loc[indexed_edges['b'].isin(nodes)][['b', 'e', 'w']].copy()
+    target_edges['h'] = target_edges['w'] / 2 + 1000
+    add_edges = source_edges[['a', 'e', 'w']].values.tolist() + target_edges[['e', 'b', 'w']].values.tolist()
+
+    # BUILD THE GRAPH
+    edge_g = nx.DiGraph()
+    edge_g.add_weighted_edges_from(edges[['e_x', 'e_y', 'w']].values.tolist())
+    edge_g.add_weighted_edges_from(add_edges)
+
+    return edge_g
+
 def get_path(
         terrain, constraints, raster,# Impedance raster
         checkpoints, checkpoints_buffer, strict_checkpoints=False, # search space
         scale=1, asf=1, isf=1, inf=np.inf, asmooth=0, ismooth=0, # slope raster and slope constraints
-        scope=1, max_slope=np.inf, smax=np.inf, smin=-np.inf # slope in percent
+        scope=1, max_slope=np.inf, smax=np.inf, smin=-np.inf, # slope in percent
+        min_radius=0 # to be implemented
+
         ):
 
     max_slope_meters = np.ceil(max_slope / 100 * raster.transform.a)
     smax_meters = np.ceil(smax / 100 * raster.transform.a)
     smin_meters = np.floor(smin / 100 * raster.transform.a)
+    min_radius_cell = min_radius / raster.transform.a
 
     elevation = raster.dataframe
     # constraints and search space
@@ -173,11 +251,32 @@ def get_path(
             ab.append([c[i], c[i+1]])
     else:
         ab= [[c[0], c[-1]]]
+
+    abindex = [(raster.index(a[0], a[1]), raster.index(b[0], b[1])) for a, b in ab]
     full_path = []
-    for a, b in ab:
-        _, path = nx.bidirectional_dijkstra(g,raster.index(a[0], a[1]), raster.index(b[0], b[1]), weight='weight')
-        full_path = full_path + path
-    return imp, full_path, g, deltas
+    edge_full_path = []
+
+    for a, b in abindex:
+        try:
+            _, path = nx.bidirectional_dijkstra(g,a, b, weight='weight')
+            full_path = full_path + path
+        except nx.NetworkXNoPath:
+            print('Failed')
+            pass
+
+    if min_radius > 0:
+        nodes = {a for a, b in abindex}.union({b for a, b in abindex})
+        keep_delta = get_deltas(scope=scope, radius=min_radius_cell)
+        edge_graph = get_edge_graph(graph=g, keep_delta=keep_delta, nodes=nodes)
+        for a, b in abindex:
+            try:
+                _, edge_path = nx.bidirectional_dijkstra(edge_graph, a, b, weight='weight')
+                node_path = [edge_path[0]]+ [n[1] for n in edge_path[1:-1]]
+                edge_full_path = edge_full_path + node_path
+            except nx.NetworkXNoPath:
+                print('Failed with min radius')
+
+    return imp, full_path, edge_full_path, g
 
 def get_height_series(path, raster):
     data = raster.data
@@ -187,6 +286,24 @@ def get_height_series(path, raster):
     s.name = 'height'
     s.index.name = 'length'
     return s
+
+def plot_height(g, raster, smin=-0.5/100, smax=2.5/100):
+    hs = get_height_series(g, raster=raster)
+    
+    hdf = hs.reset_index()
+    hdf['ds'] = hdf['length'].diff()
+    hdf['dh'] = hdf['height'].diff()
+    hdf['slope'] = hdf['dh'] / hdf['ds']
+    hdf['aslope'] = np.abs(hdf['dh'] / hdf['ds'])
+
+    z = hdf['height'].iloc[0]
+    record = [z]
+    for h, ds in hdf[['height', 'ds']].iloc[1:].values:
+        z = z + np.clip(h-z, ds*smin, ds*smax)
+        record.append(z)
+    hdf['z'] = record
+
+    return hdf.set_index('length')[['height', 'z']].plot(figsize=(15, 5))
 
 def read_parameters(file):
     parameter_frame = pd.read_excel(file, sheet_name='parameters').set_index(['category', 'parameter']).drop(['description', 'unit'], axis=1)
@@ -211,3 +328,5 @@ def read_parameters(file):
         elif v == 'json':
             var.loc[k] = var.loc[k].apply(lambda s: string_to_dict(s))
     return var
+
+# SMOOTHING
